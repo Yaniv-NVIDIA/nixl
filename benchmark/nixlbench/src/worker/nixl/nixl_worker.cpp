@@ -30,6 +30,7 @@
 #include <numeric>
 #include <sstream>
 #include "utils/neuron.h"
+#include "utils/memos_key.h"
 #include "utils/scope_guard.h"
 #include "utils/utils.h"
 #include <unistd.h>
@@ -1062,6 +1063,10 @@ xferBenchNixlWorker::allocateMemory(int num_threads) {
     opt_args.backends.push_back(backend_engine);
 
     if (xferBenchConfig::backend == XFERBENCH_BACKEND_DOCA_MEMOS) {
+        // Independent OS entropy keeps keys distinct across clients and runs,
+        // even when all clients specify the same location-randomization seed.
+        // Generate only at registration; prepopulation and reads reuse these IOVs.
+        std::random_device key_entropy;
         size_t max_batch = xferBenchConfig::max_batch_size;
         size_t total_keys = 0;
         for (int list_idx = 0; list_idx < num_threads; list_idx++) {
@@ -1070,7 +1075,8 @@ xferBenchNixlWorker::allocateMemory(int num_threads) {
                 for (size_t b = 0; b < max_batch; b++) {
                     int dev_id =
                         static_cast<int>(list_idx * num_devices * max_batch + i * max_batch + b);
-                    auto basic_desc = initBasicDescObj(buffer_size, dev_id, "");
+                    auto basic_desc = initBasicDescObj(
+                        buffer_size, dev_id, nixlbench::makeMemosKey(key_entropy));
                     if (basic_desc) {
                         iov_list.push_back(basic_desc.value());
                     }
