@@ -31,6 +31,7 @@
 #include <sstream>
 #include "utils/neuron.h"
 #include "utils/memos_key.h"
+#include "utils/memos_pipeline.h"
 #include "utils/scope_guard.h"
 #include "utils/utils.h"
 #include <unistd.h>
@@ -1926,8 +1927,8 @@ execTransferLoop(nixlAgent *agent,
             return -1;
         }
 
-        // Prepare one request per batch of keys. Only one request per worker is
-        // in flight; the working set grows independently of transfer concurrency.
+        // Prepare one request per disjoint batch of keys. Working-set size and
+        // the number of batches in flight are configured independently.
         std::vector<slotState> banks(keys / batch);
         for (size_t bank = 0; bank < banks.size(); ++bank) {
             auto &slot = banks[bank];
@@ -1941,6 +1942,31 @@ execTransferLoop(nixlAgent *agent,
                 cleanupSlots(agent, backend_engine, banks);
                 return -1;
             }
+        }
+        if (xferBenchConfig::pipeline_depth > 1) {
+            const bool success = nixlbench::runMemosPipeline(
+                banks.size(),
+                xferBenchConfig::pipeline_depth,
+                num_iter,
+                [&](size_t bank) {
+                    return postSlot(agent, thread_stats, banks[bank]) == NIXL_SUCCESS;
+                },
+                [&](size_t bank) {
+                    auto &slot = banks[bank];
+                    const auto rc = agent->getXferStatus(slot.req);
+                    if (rc == NIXL_IN_PROG) {
+                        return nixlbench::MemosBatchStatus::pending;
+                    }
+                    if (rc != NIXL_SUCCESS) {
+                        return nixlbench::MemosBatchStatus::error;
+                    }
+                    thread_stats.transfer_duration.add(nixlTime::getUs() - slot.post_ts);
+                    slot.in_flight = false;
+                    return nixlbench::MemosBatchStatus::complete;
+                },
+                [&] { return terminate_ptr && terminate_ptr->load(); });
+            cleanupSlots(agent, backend_engine, banks);
+            return success ? 0 : -1;
         }
         for (int iteration = 0; iteration < num_iter; ++iteration) {
             if (terminate_ptr && terminate_ptr->load()) {

@@ -35,9 +35,13 @@ validateMemosKeyPoolSize(size_t keys,
                          size_t batch,
                          size_t max_block_size,
                          size_t total_buffer_size,
-                         size_t threads) {
+                         size_t threads,
+                         int pipeline_depth = 1) {
     if (batch == 0 || keys < batch || keys % batch != 0) {
         throw std::invalid_argument("key count must be a positive multiple of batch size");
+    }
+    if (pipeline_depth <= 0 || static_cast<size_t>(pipeline_depth) > keys / batch) {
+        throw std::invalid_argument("pipeline depth must fit in the number of key-pool banks");
     }
     // Division avoids overflowing either the working-set size or descriptor IDs.
     if (threads == 0 || keys > static_cast<size_t>(std::numeric_limits<int>::max()) / threads) {

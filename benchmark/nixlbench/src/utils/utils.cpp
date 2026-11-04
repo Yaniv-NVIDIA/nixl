@@ -946,19 +946,20 @@ xferBenchConfig::loadParams(void) {
                 (op_type != XFERBENCH_OP_READ && op_type != XFERBENCH_OP_WRITE) ||
                 initiator_seg_type != XFERBENCH_SEG_TYPE_DRAM || num_initiator_dev != 1 ||
                 num_target_dev != 1 || mode != XFERBENCH_MODE_SG ||
-                scheme != XFERBENCH_SCHEME_PAIRWISE || pipeline_depth != 1 ||
-                start_batch_size != max_batch_size || recreate_xfer || reregister_mem ||
+                scheme != XFERBENCH_SCHEME_PAIRWISE || start_batch_size != max_batch_size ||
+                recreate_xfer || reregister_mem ||
                 randomize_location_mode != XFERBENCH_RANDOMIZE_LOCATION_MODE_NONE) {
                 throw std::invalid_argument(
                     "requires NIXL/DOCA_MEMOS READ or WRITE, DRAM, one device per side, "
-                    "SG/pairwise, pipeline_depth=1, fixed batch size, no request recreation, "
+                    "SG/pairwise, fixed batch size, no request recreation, "
                     "memory reregistration or location randomization");
             }
             nixlbench::validateMemosKeyPoolSize(memos_keys_per_thread,
                                                 max_batch_size,
                                                 max_block_size,
                                                 total_buffer_size,
-                                                num_threads > 0 ? num_threads : 0);
+                                                num_threads > 0 ? num_threads : 0,
+                                                pipeline_depth);
             std::cout << "DOCA_MEMOS: " << memos_keys_per_thread << " distinct keys per thread, "
                       << max_batch_size << " keys per transfer" << std::endl;
         }

@@ -1255,17 +1255,23 @@ for an approximately 8 GiB total working set with eight threads, use
 `floor(1 GiB / block_size / batch_size) * batch_size` keys per thread.
 
 The benchmark prepares one transfer request per batch of keys and cycles through
-those requests in order. Only one batch per worker is in flight, so this option
-does not increase I/O depth. READ prepopulation and its retrieval-success check
-visit every key before warmup and measurement. Each phase starts at the first
+those requests in order at `pipeline_depth=1`. With `--pipeline_depth=N`, each
+worker keeps up to N batches in flight, replacing each completed batch independently
+and selecting a free bank from the pool. Banks still in flight are never reused.
+The last batches drain before returning; iteration counts and existing statistics
+retain their usual meaning. This is batch-level replenishment, not FIO's
+per-I/O replenishment: batch size 32 with depth 2 allows up to 64 operations per
+worker (512 across eight workers). READ prepopulation and its retrieval-success
+check visit every key before warmup and measurement. Each phase starts at the first
 batch; a short measurement may visit only part of the pool. The retrieval check
 is not a data-integrity checksum. Request preparation is still included in the
 existing execution-loop timing; larger pools create more request handles.
 
 The option accepts decimal integers from 1 through 1,000,000. It requires the
 NIXL worker, DOCA_MEMOS READ or WRITE, DRAM, one device per side, SG/pairwise mode,
-`pipeline_depth=1`, and a fixed batch size. Request recreation, memory
-reregistration, QUERY, and location randomization are unsupported and rejected.
+a positive `pipeline_depth` no larger than `keys_per_thread / batch_size`, and a
+fixed batch size. Request recreation, memory reregistration, QUERY, and location
+randomization are unsupported and rejected.
 The full pool must fit in each thread's buffer at `max_block_size`. Existing
 random 128-bit object keys remain independent across threads and runs. Unset the
 environment variable to retain the default transfer path and key count.

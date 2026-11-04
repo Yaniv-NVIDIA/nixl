@@ -53,6 +53,13 @@ main() {
         constexpr size_t gib = size_t{1} << 30;
         // Eight threads, 2,048 keys per thread, 512 KiB values: exactly 8 GiB.
         nixlbench::validateMemosKeyPoolSize(2048, 32, 512 * 1024, 8 * gib, 8);
+        nixlbench::validateMemosKeyPoolSize(2048, 32, 512 * 1024, 8 * gib, 8, 2);
+        nixlbench::validateMemosKeyPoolSize(2048, 32, 512 * 1024, 8 * gib, 8, 64);
+        for (int depth : {-1, 0, 65}) {
+            reject([&] {
+                nixlbench::validateMemosKeyPoolSize(2048, 32, 512 * 1024, 8 * gib, 8, depth);
+            });
+        }
         // Whole-bank rounding supports non-power-of-two value sizes as well.
         nixlbench::validateMemosKeyPoolSize(2048, 32, 508 * 1024, 8 * gib, 8);
         nixlbench::validateMemosKeyPoolSize(32, 32, 512 * 1024, 8 * gib, 8);
