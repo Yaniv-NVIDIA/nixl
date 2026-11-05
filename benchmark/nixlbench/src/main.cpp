@@ -1,3 +1,4 @@
+#include <cstdlib>
 /*
  * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
@@ -118,6 +119,9 @@ static int processBatchSizes(xferBenchWorker &worker,
              batch_size <= xferBenchConfig::max_batch_size;
          batch_size *= 2) {
         size_t effective_batch = batch_size * xferBenchConfig::pipeline_depth;
+        if (const char *pool = std::getenv("NIXLBENCH_MEMOS_KEYS_PER_THREAD")) {
+            effective_batch = std::stoull(pool);
+        }
         auto local_trans_lists =
             createTransferDescLists(worker, iov_lists, block_size, effective_batch, num_threads);
 

@@ -21,8 +21,11 @@
 #include <cctype>
 #include <chrono>
 #include <cstring>
+#include <cstdlib>
 #include <fcntl.h>
 #include <filesystem>
+#include <fstream>
+#include <time.h>
 #include <iomanip>
 #include "kernels/nixlbench_device_launch.cuh"
 #include <limits>
@@ -46,6 +49,56 @@
 #ifndef MAP_HUGE_2MB
 #define MAP_HUGE_2MB (21 << 26) // 2MB hugepage size encoding
 #endif
+
+// Corrective experiment controls; production libraries are unchanged.
+static size_t experimentNumber(const char *name, size_t fallback = 0) {
+    const char *value = std::getenv(name);
+    if (!value) return fallback;
+    char *end = nullptr;
+    auto n = std::strtoull(value, &end, 10);
+    if (!end || *end) std::abort();
+    return n;
+}
+static unsigned long long experimentClockUs() {
+    timespec t{};
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return static_cast<unsigned long long>(t.tv_sec) * 1000000ULL + t.tv_nsec / 1000;
+}
+static void experimentGate() {
+    const char *dir = std::getenv("NIXLBENCH_READY_DIR");
+    if (!dir) return;
+    const size_t worker = experimentNumber("NIXLBENCH_AGENT_ID") + omp_get_thread_num();
+    const auto root = std::filesystem::path(dir);
+    { std::ofstream ready(root / ("ready-" + std::to_string(worker))); ready << getpid(); }
+    const auto deadline = experimentClockUs() + 180000000ULL;
+    while (!std::filesystem::exists(root / "go")) {
+        if (experimentClockUs() > deadline) std::abort();
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    unsigned long long start = 0;
+    { std::ifstream go(root / "go"); go >> start; }
+    if (!start) std::abort();
+    while (experimentClockUs() < start)
+        std::this_thread::sleep_for(std::chrono::microseconds(50));
+}
+
+// Experiment-only key-pool size; unset preserves the original benchmark.
+static size_t memosKeyPoolSize() {
+    const char *value = std::getenv("NIXLBENCH_MEMOS_KEYS_PER_THREAD");
+    if (!value) return 0;
+    char *end = nullptr;
+    const unsigned long long count = std::strtoull(value, &end, 10);
+    if (!end || *end || count == 0 || count > 1000000 ||
+        xferBenchConfig::backend != XFERBENCH_BACKEND_DOCA_MEMOS ||
+        xferBenchConfig::pipeline_depth < 1 ||
+        static_cast<size_t>(xferBenchConfig::pipeline_depth) > count / xferBenchConfig::max_batch_size ||
+        xferBenchConfig::start_batch_size != xferBenchConfig::max_batch_size ||
+        count % xferBenchConfig::max_batch_size != 0) {
+        std::cerr << "Invalid expanded MEMOS key-pool configuration" << std::endl;
+        std::exit(EXIT_FAILURE);
+    }
+    return static_cast<size_t>(count);
+}
 
 static nixl_mem_t
 resolveVramSegment() {
@@ -1063,20 +1116,21 @@ xferBenchNixlWorker::allocateMemory(int num_threads) {
     opt_args.backends.push_back(backend_engine);
 
     if (xferBenchConfig::backend == XFERBENCH_BACKEND_DOCA_MEMOS) {
-        // Independent OS entropy keeps keys distinct across clients and runs,
-        // even when all clients specify the same location-randomization seed.
-        // Generate only at registration; prepopulation and reads reuse these IOVs.
         std::random_device key_entropy;
-        size_t max_batch = xferBenchConfig::max_batch_size;
+        std::ofstream key_manifest("memos-keys.txt");
+        if (!key_manifest) std::abort();
+        std::cout << "MEMOS_DISTRIBUTED_KEYS random128 metaInfo=hex32 source=f6983a0911519ad3cc9b22f35e3946f929c7d743" << std::endl;
+        size_t max_batch = memosKeyPoolSize() ? memosKeyPoolSize() : xferBenchConfig::max_batch_size;
         size_t total_keys = 0;
         for (int list_idx = 0; list_idx < num_threads; list_idx++) {
             std::vector<xferBenchIOV> iov_list;
             for (i = 0; i < num_devices; i++) {
                 for (size_t b = 0; b < max_batch; b++) {
                     int dev_id =
-                        static_cast<int>(list_idx * num_devices * max_batch + i * max_batch + b);
-                    auto basic_desc = initBasicDescObj(
-                        buffer_size, dev_id, nixlbench::makeMemosKey(key_entropy));
+                        static_cast<int>(experimentNumber("NIXLBENCH_KEY_OFFSET") + list_idx * num_devices * max_batch + i * max_batch + b);
+                    const auto object_key = nixlbench::makeMemosKey(key_entropy);
+                    key_manifest << object_key << '\n';
+                    auto basic_desc = initBasicDescObj(buffer_size, dev_id, object_key);
                     if (basic_desc) {
                         iov_list.push_back(basic_desc.value());
                     }
@@ -1811,7 +1865,147 @@ execTransferLoop(nixlAgent *agent,
                  xferBenchStats &thread_stats,
                  const std::vector<xferBenchIOV> &local_iov,
                  const std::vector<xferBenchIOV> &remote_iov,
-                 const std::atomic<int> *terminate_ptr = nullptr) {
+                 const std::atomic<int> *terminate_ptr = nullptr,
+                 double timed_seconds = 0) {
+    if (memosKeyPoolSize()) {
+        const size_t batch = xferBenchConfig::max_batch_size;
+        if (local_iov.size() != memosKeyPoolSize() || remote_iov.size() != local_iov.size() ||
+            xferBenchConfig::reregister_mem || xferBenchConfig::recreate_xfer) return -1;
+        const size_t banks = local_iov.size() / batch;
+        std::vector<slotState> pool(banks);
+        for (size_t b = 0; b < banks; ++b) {
+            auto &slot = pool[b];
+            slot.local_iov.assign(local_iov.begin() + b * batch, local_iov.begin() + (b+1) * batch);
+            slot.remote_iov.assign(remote_iov.begin() + b * batch, remote_iov.begin() + (b+1) * batch);
+            auto rc = prepareSlot(agent, backend_engine, op, target, params, thread_stats, slot);
+            if (rc != NIXL_SUCCESS) { cleanupSlots(agent, backend_engine, pool); return -1; }
+        }
+        // Expanded-key sliding window: each lane owns a distinct prepared bank.
+        // Complete individual batches and refill lanes without a global batch barrier.
+        if (xferBenchConfig::pipeline_depth > 1) {
+            const size_t depth = std::min<size_t>(xferBenchConfig::pipeline_depth, num_iter);
+            std::vector<size_t> active(depth);
+            size_t next_bank = depth % banks;
+            unsigned long long issued = 0, completed = 0;
+            size_t inflight = 0, peak = 0;
+            const bool reuse_buffers = experimentNumber("NIXLBENCH_REUSE_LOCAL") != 0;
+            if (reuse_buffers) {
+                if (banks % depth != 0) std::abort();
+                std::vector<uint64_t> addresses;
+                for(size_t lane=0;lane<depth;lane++) {
+                    if(pool[lane].local_iov.size()!=batch)std::abort();
+                    for(size_t j=0;j<batch;j++)addresses.push_back(pool[lane].local_iov[j].addr);
+                }
+                for(size_t b=0;b<banks;b++) {
+                    if(pool[b].local_iov.size()!=batch)std::abort();
+                    for(size_t j=0;j<batch;j++)
+                        if(pool[b].local_iov[j].addr!=addresses[(b%depth)*batch+j])std::abort();
+                }
+                std::sort(addresses.begin(),addresses.end());
+                if(std::unique(addresses.begin(),addresses.end())!=addresses.end())std::abort();
+                if(timed_seconds>0) {
+                    #pragma omp critical
+                    { std::cout << "REUSE_PROOF " << omp_get_thread_num() << " " << batch << " " << depth << " " << addresses.size() << " " << addresses.front() << " " << addresses.back()+pool[0].local_iov[0].len << std::endl; }
+                }
+            }
+            std::vector<unsigned long long> lane_issued(depth, 1);
+            #pragma omp barrier
+            if (timed_seconds > 0) experimentGate();
+            const auto absolute_start = experimentClockUs();
+            const auto timed_start = nixlTime::getUs();
+            auto issue = [&](size_t bank) {
+                auto rc = postSlot(agent, thread_stats, pool[bank]);
+                if (rc == NIXL_SUCCESS) {
+                    ++issued; ++inflight; peak = std::max(peak, inflight);
+                }
+                return rc;
+            };
+            for (size_t lane = 0; lane < depth; ++lane) {
+                active[lane] = lane;
+                if (issue(lane) != NIXL_SUCCESS) { cleanupSlots(agent, backend_engine, pool); return -1; }
+            }
+            while (inflight) {
+                if (terminate_ptr && terminate_ptr->load()) { cleanupSlots(agent, backend_engine, pool); return -1; }
+                for (size_t lane = 0; lane < depth; ++lane) {
+                    auto &slot = pool[active[lane]];
+                    if (!slot.in_flight) continue;
+                    auto rc = agent->getXferStatus(slot.req);
+                    if (rc == NIXL_IN_PROG) continue;
+                    if (rc != NIXL_SUCCESS) { cleanupSlots(agent, backend_engine, pool); return -1; }
+                    thread_stats.transfer_duration.add(nixlTime::getUs() - slot.post_ts);
+                    slot.in_flight = false;
+                    ++completed; --inflight;
+                    const bool more = timed_seconds > 0 ?
+                        (nixlTime::getUs() - timed_start < timed_seconds * 1e6) :
+                        (reuse_buffers ?
+                            lane_issued[lane] < static_cast<unsigned long long>(num_iter) / depth + (lane < static_cast<size_t>(num_iter) % depth) :
+                            issued < static_cast<unsigned long long>(num_iter));
+                    if (more) {
+                        if (reuse_buffers) {
+                            // Each lane owns one local buffer and cycles disjoint remote keys.
+                            active[lane] = (active[lane] + depth) % banks;
+                            if (pool[active[lane]].in_flight) std::abort();
+                        } else {
+                            while (pool[next_bank].in_flight) next_bank = (next_bank + 1) % banks;
+                            active[lane] = next_bank;
+                            next_bank = (next_bank + 1) % banks;
+                        }
+                        if (issue(active[lane]) != NIXL_SUCCESS) { cleanupSlots(agent, backend_engine, pool); return -1; }
+                        ++lane_issued[lane];
+                    }
+                }
+            }
+            const auto elapsed = nixlTime::getUs() - timed_start;
+            if (issued != completed) { cleanupSlots(agent, backend_engine, pool); return -1; }
+            if (timed_seconds > 0) {
+                #pragma omp critical
+                {
+                    std::cout << "TIMING_INTERVAL " << omp_get_thread_num() << " " << absolute_start << " " << experimentClockUs() << std::endl;
+                    std::cout << "TIMED_RESULT " << omp_get_thread_num() << " " << completed << " " << elapsed << std::endl;
+                    std::cout << "PIPELINE_RESULT " << omp_get_thread_num() << " " << peak << " " << issued << " " << completed << " " << inflight << std::endl;
+                }
+            }
+            cleanupSlots(agent, backend_engine, pool);
+            return 0;
+        }
+        // Depth1 retains its whole-batch barrier. Only timing/proof is added.
+        if (experimentNumber("NIXLBENCH_REUSE_LOCAL")) {
+            if (batch != 32) std::abort();
+            std::vector<uint64_t> addresses;
+            for (size_t j=0;j<batch;j++)addresses.push_back(local_iov[j].addr);
+            std::sort(addresses.begin(),addresses.end());
+            if(std::unique(addresses.begin(),addresses.end())!=addresses.end())std::abort();
+            for(size_t b=0;b<banks;b++)for(size_t j=0;j<batch;j++)
+                if(local_iov[b*batch+j].addr!=local_iov[j].addr)std::abort();
+        }
+        #pragma omp barrier
+        if (timed_seconds > 0) experimentGate();
+        const auto absolute_start = experimentClockUs();
+        const auto timed_start = nixlTime::getUs();
+        unsigned long long timed_count = 0;
+        for (int iteration = 0; timed_seconds > 0 ? (nixlTime::getUs() - timed_start < timed_seconds * 1e6) : (iteration < num_iter); ++iteration) {
+            if (terminate_ptr && terminate_ptr->load()) { cleanupSlots(agent, backend_engine, pool); return -1; }
+            auto &slot = pool[static_cast<size_t>(iteration) % banks];
+            auto rc = postSlot(agent, thread_stats, slot);
+            if (rc != NIXL_SUCCESS) { cleanupSlots(agent, backend_engine, pool); return -1; }
+            do { rc = agent->getXferStatus(slot.req); } while (rc == NIXL_IN_PROG);
+            if (rc != NIXL_SUCCESS) { cleanupSlots(agent, backend_engine, pool); return -1; }
+            thread_stats.transfer_duration.add(nixlTime::getUs() - slot.post_ts);
+            slot.in_flight = false;
+            ++timed_count;
+        }
+        const auto timed_elapsed = nixlTime::getUs() - timed_start;
+        if (timed_seconds > 0) {
+            #pragma omp critical
+            {
+                std::cout << "TIMING_INTERVAL " << omp_get_thread_num() << " " << absolute_start << " " << experimentClockUs() << std::endl;
+                std::cout << "TIMED_RESULT " << omp_get_thread_num() << " " << timed_count << " " << timed_elapsed << std::endl;
+                std::cout << "PIPELINE_RESULT " << omp_get_thread_num() << " 1 " << timed_count << " " << timed_count << " 0" << std::endl;
+            }
+        }
+        cleanupSlots(agent, backend_engine, pool);
+        return 0;
+    }
     const int depth = std::min(xferBenchConfig::pipeline_depth, num_iter);
     if (depth < xferBenchConfig::pipeline_depth) {
         std::cout << "Warning: pipeline_depth (" << xferBenchConfig::pipeline_depth
@@ -1936,7 +2130,8 @@ execTransfer(nixlAgent *agent,
              const int num_iter,
              const int num_threads,
              xferBenchStats &stats,
-             const std::atomic<int> *terminate_ptr = nullptr) {
+             const std::atomic<int> *terminate_ptr = nullptr,
+             bool timed_measurement = false) {
     int ret = 0;
     stats.clear();
 
@@ -1965,7 +2160,8 @@ execTransfer(nixlAgent *agent,
                                       thread_stats,
                                       local_iov,
                                       remote_iov,
-                                      terminate_ptr);
+                                      terminate_ptr,
+                                      timed_measurement ? static_cast<double>(experimentNumber("NIXLBENCH_SECONDS", 30)) : 0.0);
 
         if (result != 0) [[unlikely]] {
             ret = result;
@@ -2317,7 +2513,7 @@ xferBenchNixlWorker::transfer(size_t block_size,
                            local_iovs,
                            remote_iovs,
                            NIXL_WRITE,
-                           1,
+                           memosKeyPoolSize() ? memosKeyPoolSize() / xferBenchConfig::max_batch_size : 1,
                            xferBenchConfig::num_threads,
                            prepop_stats);
         if (ret < 0) {
@@ -2335,7 +2531,7 @@ xferBenchNixlWorker::transfer(size_t block_size,
                            local_iovs,
                            remote_iovs,
                            NIXL_READ,
-                           1,
+                           memosKeyPoolSize() ? memosKeyPoolSize() / xferBenchConfig::max_batch_size : 1,
                            xferBenchConfig::num_threads,
                            verify_stats);
         if (ret < 0) {
@@ -2433,7 +2629,8 @@ xferBenchNixlWorker::transfer(size_t block_size,
                            num_iter,
                            xferBenchConfig::num_threads,
                            stats,
-                           &terminate);
+                           &terminate,
+                           true);
     }
     if (ret < 0) {
         return std::variant<xferBenchStats, int>(ret);
