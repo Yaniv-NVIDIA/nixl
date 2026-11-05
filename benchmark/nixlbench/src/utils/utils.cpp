@@ -178,6 +178,8 @@ NB_ARG_INT32(large_blk_iter_ftr,
              16,
              "factor to reduce test iteration when testing large block size(>1MB)");
 NB_ARG_INT32(warmup_iter, 100, "Number of warmup iterations before timing");
+NB_ARG_INT32(warmup_seconds, 0, "Continuous timed warmup before duration measurement");
+NB_ARG_INT32(duration_seconds, 0, "Steady-state measurement seconds; 0 retains iteration mode");
 NB_ARG_INT32(num_threads,
              1,
              "Number of threads used by benchmark."
@@ -386,6 +388,8 @@ size_t xferBenchConfig::max_batch_size = 0;
 int xferBenchConfig::num_iter = 0;
 int xferBenchConfig::large_blk_iter_ftr = 16;
 int xferBenchConfig::warmup_iter = 0;
+int xferBenchConfig::warmup_seconds = 0;
+int xferBenchConfig::duration_seconds = 0;
 int xferBenchConfig::num_threads = 0;
 bool xferBenchConfig::enable_pt = false;
 size_t xferBenchConfig::progress_threads = 0;
@@ -828,6 +832,8 @@ xferBenchConfig::loadParams(void) {
     }
     large_blk_iter_ftr = NB_ARG(large_blk_iter_ftr);
     warmup_iter = NB_ARG(warmup_iter);
+    warmup_seconds = NB_ARG(warmup_seconds);
+    duration_seconds = NB_ARG(duration_seconds);
     num_threads = NB_ARG(num_threads);
     pipeline_depth = NB_ARG(pipeline_depth);
     if (pipeline_depth < 1) {
@@ -940,12 +946,16 @@ xferBenchConfig::loadParams(void) {
     }
 
     try {
+        nixlbench::validateDurationSeconds(warmup_seconds, duration_seconds);
         memos_keys_per_thread =
             nixlbench::parseMemosKeyPoolSize(std::getenv("NIXLBENCH_MEMOS_KEYS_PER_THREAD"));
         memos_reuse_local =
             nixlbench::parseMemosReuseLocal(std::getenv("NIXLBENCH_REUSE_LOCAL"));
         if (memos_reuse_local && memos_keys_per_thread == 0) {
             throw std::invalid_argument("local buffer reuse requires a MEMOS key pool");
+        }
+        if (duration_seconds > 0 && (memos_keys_per_thread == 0 || use_device_api)) {
+            throw std::invalid_argument("duration mode requires the host MEMOS key-pool path");
         }
         if (memos_keys_per_thread != 0) {
             if (worker_type != XFERBENCH_WORKER_NIXL || backend != XFERBENCH_BACKEND_DOCA_MEMOS ||
@@ -1121,6 +1131,8 @@ xferBenchConfig::printConfig() {
         printOption("Prepared xfer (prep+make) (--prepared_xfer=[0,1])",
                     std::to_string(prepared_xfer));
         printOption("Pipeline depth (--pipeline_depth=N)", std::to_string(pipeline_depth));
+        printOption("Warmup seconds (--warmup_seconds=N)", std::to_string(warmup_seconds));
+        printOption("Duration seconds (--duration_seconds=N)", std::to_string(duration_seconds));
         printOption("Use hugepages (--use_hugepages=[0,1])", std::to_string(use_hugepages));
 
         // Print GDS options if backend is GDS
@@ -1687,6 +1699,7 @@ xferBenchUtils::printStats(bool is_target,
         return;
     }
 
+    const bool duration_mode = stats.duration.window_end_us != 0;
     double total_duration = stats.total_duration.avg();
 
     total_data_transferred = ((block_size * batch_size) * total_iter); // In Bytes
@@ -1697,6 +1710,33 @@ xferBenchUtils::printStats(bool is_target,
         avg_latency /= xferBenchConfig::num_initiator_dev; // In microsec
     }
 
+    if (duration_mode) {
+        total_data_transferred = nixlbench::completedBytes(
+            stats.duration.measured_batches, batch_size, block_size);
+        total_duration = stats.duration.window_end_us - stats.duration.window_start_us;
+        // Native Avg Lat remains amortized wall time per worker/I/O, not device latency.
+        avg_latency = total_duration * xferBenchConfig::num_threads /
+                      (stats.duration.measured_batches * batch_size);
+        std::cout << "STEADY_STATE warmup_seconds=" << xferBenchConfig::warmup_seconds
+                  << " workers=" << stats.duration.workers
+                  << " workers_with_completions=" << stats.duration.workers_with_completions
+                  << " workers_with_warmup=" << stats.duration.workers_with_warmup
+                  << " measurement_seconds=" << xferBenchConfig::duration_seconds
+                  << " warmup_start_us=" << stats.duration.window_start_us -
+                         static_cast<uint64_t>(xferBenchConfig::warmup_seconds) * 1000000
+                  << " window_start_us=" << stats.duration.window_start_us
+                  << " window_end_us=" << stats.duration.window_end_us
+                  << " measured_batches=" << stats.duration.measured_batches
+                  << " measured_ios=" << stats.duration.measured_batches * batch_size
+                  << " measured_bytes=" << total_data_transferred
+                  << " warmup_batches=" << stats.duration.warmup_batches
+                  << " drain_batches=" << stats.duration.drain_batches
+                  << " drain_us=" << stats.duration.drainUs()
+                  << " issued_batches=" << stats.duration.issued_batches
+                  << " completed_batches=" << stats.duration.completed_batches
+                  << " latency_batches=" << stats.duration.latency_batches
+                  << " sum_worker_peak_batches=" << stats.duration.peak_batches << std::endl;
+    }
     throughput_gb = (((double)total_data_transferred / (1000 * 1000 * 1000)) /
                      (total_duration / 1e6)); // In GB/Sec
 
@@ -1710,6 +1750,12 @@ xferBenchUtils::printStats(bool is_target,
         return;
     }
 
+    auto preparationText = [&](double value) {
+        if (duration_mode) return std::string("n/a");
+        std::ostringstream text;
+        text << std::fixed << std::setprecision(1) << value;
+        return text.str();
+    };
     double prepare_duration = stats.prepare_duration.avg();
     double prepare_p99_duration = stats.prepare_duration.p99();
     double post_duration = stats.post_duration.avg();
@@ -1728,8 +1774,8 @@ xferBenchUtils::printStats(bool is_target,
                   << std::setw(20) << (totalbw / (rt->getSize() / 2 * MAXBW)) * 100
                   << std::setprecision(1)
                   << std::setw(15) << avg_latency
-                  << std::setw(15) << prepare_duration
-                  << std::setw(15) << prepare_p99_duration
+                  << std::setw(15) << preparationText(prepare_duration)
+                  << std::setw(15) << preparationText(prepare_p99_duration)
                   << std::setw(15) << post_duration
                   << std::setw(15) << post_p99_duration
                   << std::setw(15) << transfer_duration
@@ -1744,8 +1790,8 @@ xferBenchUtils::printStats(bool is_target,
                   << std::setw(15) << throughput_gb
                   << std::setprecision(1)
                   << std::setw(15) << avg_latency
-                  << std::setw(15) << prepare_duration
-                  << std::setw(15) << prepare_p99_duration
+                  << std::setw(15) << preparationText(prepare_duration)
+                  << std::setw(15) << preparationText(prepare_p99_duration)
                   << std::setw(15) << post_duration
                   << std::setw(15) << post_p99_duration
                   << std::setw(15) << transfer_duration
@@ -2173,6 +2219,7 @@ xferMetricStats::clear() {
 
 void
 xferBenchStats::clear() {
+    duration = {};
     total_duration.clear();
     prepare_duration.clear();
     post_duration.clear();
@@ -2181,6 +2228,7 @@ xferBenchStats::clear() {
 
 void
 xferBenchStats::add(const xferBenchStats &other) {
+    duration.add(other.duration);
     total_duration.add(other.total_duration);
     prepare_duration.add(other.prepare_duration);
     post_duration.add(other.post_duration);

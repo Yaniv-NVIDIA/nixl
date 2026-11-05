@@ -29,6 +29,13 @@ memos_buffer_tests = executable(
 )
 test('memos_buffer_tests', memos_buffer_tests, suite: 'nixlbench')
 
+memos_duration_tests = executable(
+  'memos_duration_tests',
+  'memos_duration_test.cpp',
+  include_directories: inc_dir,
+)
+test('memos_duration_tests', memos_duration_tests, suite: 'nixlbench')
+
 gtest_dep = dependency('gtest',
                        main: true,
                        required: false)

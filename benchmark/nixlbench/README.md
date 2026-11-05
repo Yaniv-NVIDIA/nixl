@@ -1297,3 +1297,38 @@ sweeps use the same logical slot mapping.
 Existing
 random 128-bit object keys remain independent across threads and runs. Unset the
 environment variable to retain the default transfer path and key count.
+
+### Timed steady-state MEMOS measurements
+
+Use `--warmup_seconds=1 --duration_seconds=30` with the host MEMOS key-pool
+path to replace the iteration-based warmup and measurement with a continuous
+pipeline. Both flags accept whole seconds from 0 through 86,400. Duration 0
+retains the existing iteration mode; positive timed warmup requires positive
+duration. The first implementation supports one process, host NIXL/DOCA_MEMOS,
+DRAM, SG/pairwise, a fixed batch, one device per side, and the key-pool option.
+Unsupported worker/backend/device/multi-process combinations are rejected.
+
+Key prepopulation and the retrieval-success check still traverse the entire
+key pool using iteration counts. Each worker then prepares its requests before
+a common process-wide monotonic start. All workers use the same warmup and
+measurement deadlines. Warmup flows directly into measurement without a drain,
+request recreation, or equal iteration quotas: faster lanes may complete more
+batches. `num_iter`, `warmup_iter`, and `large_blk_iter_ftr` do not determine the
+duration-mode measurement budget.
+
+Throughput counts batches whose successful completions are **observed** within
+`[measurement_start, measurement_end)`, including warmup-issued batches that
+complete inside the measurement window. At the deadline, workers stop posting
+and drain outstanding requests. Later completions count only as drain work;
+their bytes and drain/cleanup time are excluded from steady-state throughput.
+Latency samples require both posting and completion inside the measurement
+window. Request preparation is outside the window and is displayed as `n/a`.
+Native `Avg Lat.` remains amortized worker time per I/O, not hardware queue
+latency. Completions are timed at polling observation, not by device timestamps.
+
+The `STEADY_STATE` record reports actual measured batches, I/Os and bytes,
+window timestamps, warmup and drain completions, drain time, issued/completed
+counts, worker coverage, and the sum of per-worker API batch peaks. That peak
+is not an NVMe hardware queue-depth measurement. As with iteration mode,
+latency statistics are collected in memory; very long/high-rate runs can grow
+these sample vectors. No result is emitted if the window has no completions.
