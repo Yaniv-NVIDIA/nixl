@@ -1,0 +1,15 @@
+{
+  "baseline_archive_sha256": "f4ac7a0e424e9ef1ed68169722c11de8ca1409fbefb1ea0762dca5a95dade38f",
+  "corrected_archive_sha256": "9433c325b9af070f929d1c50c2bb56580b539c338920140e986e6301c0fd8919",
+  "changed_files": [
+    "benchmark/nixlbench/src/main.cpp"
+  ],
+  "baseline_changed_file_sha256": {
+    "benchmark/nixlbench/src/main.cpp": "23402fc726167178d87ba00ff0f188be23ca79b73bba9b02118dbdc76856b6c1"
+  },
+  "corrected_changed_file_sha256": {
+    "benchmark/nixlbench/src/main.cpp": "bce6d6df1eb5013b0a8c1835d3481e22a613f696ac459a7f81535b0c9fc429e8"
+  },
+  "production_libraries_changed": false,
+  "f698_helper_changed": false
+}

@@ -437,5 +437,9 @@ else
 endif
 
 if get_option('build_tests') and get_option('buildtype') != 'release'
-    subdir('tests')
+    if raw_cli_available
+        subdir('tests')
+    else
+        message('Skipping raw CLI tests because the raw command path is not built.')
+    endif
 endif

@@ -1,0 +1,28 @@
+--- a/benchmark/nixlbench/src/main.cpp
++++ b/benchmark/nixlbench/src/main.cpp
+@@ -88,12 +88,22 @@
+         std::vector<xferBenchIOV> xfer_list;
+ 
+         for (const auto &iov : iov_list) {
++            size_t cycle_len = iov.len;
++            const char *reuse = std::getenv("NIXLBENCH_REUSE_LOCAL");
++            if (reuse && std::strtoull(reuse, nullptr, 10) != 0 &&
++                std::getenv("NIXLBENCH_MEMOS_KEYS_PER_THREAD") &&
++                xferBenchConfig::backend == XFERBENCH_BACKEND_DOCA_MEMOS) {
++                // Hugepage rounding is allocation padding, not additional reuse slots.
++                cycle_len = block_size * xferBenchConfig::max_batch_size *
++                            xferBenchConfig::pipeline_depth;
++                if (count != 1 || cycle_len == 0 || cycle_len > iov.len) std::abort();
++            }
+             for (size_t i = 0; i < count; i++) {
+-                size_t dev_offset = ((i * stride) % iov.len);
++                size_t dev_offset = ((i * stride) % cycle_len);
+ 
+                 for (size_t j = 0; j < batch_size; j++) {
+-                    size_t block_offset = ((j * block_size) % iov.len);
+-                    if (block_offset + block_size > iov.len) {
++                    size_t block_offset = ((j * block_size) % cycle_len);
++                    if (block_offset + block_size > cycle_len) {
+                         // Prevent memory overflow when iov.len is not divisible by block_size
+                         block_offset = 0;
+                     }

@@ -1,18 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-memos_key_tests = executable(
-  'memos_key_tests',
-  'memos_key_test.cpp',
-  include_directories: inc_dir,
-)
-test('memos_key_tests', memos_key_tests, suite: 'nixlbench')
-
 gtest_dep = dependency('gtest',
                        main: true,
                        required: false)
 
-if gtest_dep.found() and raw_cli_available
+if gtest_dep.found()
   nixlbench_tests = executable(
     'nixlbench_tests',
     ['raw_cli_test.cpp', 'posix_integration_test.cpp'],
@@ -30,5 +23,5 @@ if gtest_dep.found() and raw_cli_available
        timeout: 180,
        suite: 'nixlbench')
 else
-  message('GoogleTest or raw CLI not available. Skipping raw CLI tests.')
+  message('GoogleTest not found. Skipping NIXLBench tests.')
 endif

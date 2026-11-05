@@ -18,8 +18,7 @@ utils_sources = [
   'neuron.h',
   'utils.cpp',
   'utils.h',
-  'scope_guard.h',
-  'memos_key.h'
+  'scope_guard.h'
 ]
 
 utils_deps = [
