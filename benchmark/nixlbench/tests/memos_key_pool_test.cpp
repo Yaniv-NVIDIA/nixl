@@ -50,6 +50,23 @@ main() {
             reject([&] { nixlbench::parseMemosKeyPoolSize(text); });
         }
 
+        check(!nixlbench::parseMemosReuseLocal(nullptr));
+        check(!nixlbench::parseMemosReuseLocal("0"));
+        check(nixlbench::parseMemosReuseLocal("1"));
+        for (const char *text : {"", "2", "-1", "true", "1junk", " 1"}) {
+            reject([&] { nixlbench::parseMemosReuseLocal(text); });
+        }
+        // 8,192 remote keys, but only 64 local values per worker.
+        nixlbench::validateMemosKeyPoolSize(8192, 32, 512 * 1024, 256 * 512 * 1024, 4, 2, true);
+        reject([&] {
+            nixlbench::validateMemosKeyPoolSize(8192, 32, 512 * 1024, 256 * 512 * 1024 - 1, 4, 2, true);
+        });
+        reject([&] {
+            nixlbench::validateMemosKeyPoolSize(96, 32, 1, 64, 1, 2, true);
+        });
+        reject([&] {
+            nixlbench::validateMemosKeyPoolSize(8192, 32, 512 * 1024, 256 * 512 * 1024, 4, 2, false);
+        });
         constexpr size_t gib = size_t{1} << 30;
         // Eight threads, 2,048 keys per thread, 512 KiB values: exactly 8 GiB.
         nixlbench::validateMemosKeyPoolSize(2048, 32, 512 * 1024, 8 * gib, 8);

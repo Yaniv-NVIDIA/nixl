@@ -1272,6 +1272,23 @@ NIXL worker, DOCA_MEMOS READ or WRITE, DRAM, one device per side, SG/pairwise mo
 a positive `pipeline_depth` no larger than `keys_per_thread / batch_size`, and a
 fixed batch size. Request recreation, memory reregistration, QUERY, and location
 randomization are unsupported and rejected.
-The full pool must fit in each thread's buffer at `max_block_size`. Existing
+By default, the full pool must fit in each thread's buffer at `max_block_size`.
+Set `NIXLBENCH_REUSE_LOCAL=1` with the key-pool option to use only
+`batch_size * pipeline_depth` local value buffers per worker. For example,
+8,192 keys per worker, eight workers, batch 32 and depth 2 with 512 KiB values
+need 256 MiB of local buffers, while the remote working set remains 32 GiB.
+Use `--total_buffer_size=268435456` for that configuration. Reuse defaults to
+off; the variable accepts only `0` or `1` and requires the key-pool mode.
+
+Reuse requires the number of key banks to be divisible by pipeline depth.
+Each lane keeps its local buffers until completion and advances through its
+own key banks. Fixed per-lane iteration budgets ensure prepopulation and the
+retrieval check visit every key despite out-of-order completions. At the end
+of a phase, a fast lane may drain before a slower lane finishes its budget.
+Native iteration counts, timing and statistics are unchanged. Initially,
+reuse requires the local region to exactly match the current block size times
+batch size times depth; padded allocations are rejected.
+
+Existing
 random 128-bit object keys remain independent across threads and runs. Unset the
 environment variable to retain the default transfer path and key count.

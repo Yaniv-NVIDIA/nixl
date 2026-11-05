@@ -22,6 +22,13 @@ memos_pipeline_tests = executable(
 )
 test('memos_pipeline_tests', memos_pipeline_tests, suite: 'nixlbench')
 
+memos_buffer_tests = executable(
+  'memos_buffer_tests',
+  'memos_buffer_test.cpp',
+  include_directories: inc_dir,
+)
+test('memos_buffer_tests', memos_buffer_tests, suite: 'nixlbench')
+
 gtest_dep = dependency('gtest',
                        main: true,
                        required: false)

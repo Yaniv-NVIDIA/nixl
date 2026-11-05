@@ -26,6 +26,7 @@ struct MockTransfers {
     int completed = 0;
     int fail_post = -1;
     int fail_poll = -1;
+    int reuse_depth = 0;
     bool refilled_before_first_completion = false;
 
     explicit MockTransfers(size_t banks) : remaining(banks), visits(banks) {}
@@ -33,6 +34,12 @@ struct MockTransfers {
     bool
     post(size_t bank) {
         check(bank < remaining.size() && remaining[bank] == 0);
+        if (reuse_depth != 0) {
+            // Different key banks can alias the same physical local buffers.
+            for (size_t other = 0; other < remaining.size(); ++other) {
+                check(remaining[other] == 0 || other % reuse_depth != bank % reuse_depth);
+            }
+        }
         if (issued == fail_post) {
             return false;
         }
@@ -63,14 +70,16 @@ struct MockTransfers {
     }
 
     bool
-    run(int depth, int iterations, int cancel_after = -1) {
+    run(int depth, int iterations, int cancel_after = -1, bool reuse_local = false) {
+        reuse_depth = reuse_local ? depth : 0;
         return nixlbench::runMemosPipeline(
             remaining.size(),
             depth,
             iterations,
             [&](size_t bank) { return post(bank); },
             [&](size_t bank) { return poll(bank); },
-            [&] { return cancel_after >= 0 && completed >= cancel_after; });
+            [&] { return cancel_after >= 0 && completed >= cancel_after; },
+            reuse_local);
     }
 };
 
@@ -100,6 +109,41 @@ main() {
                     }
                 }
             }
+        }
+        // Reused-buffer lanes must never post two banks sharing buffers.
+        // A slow bank zero also exercises out-of-order completions and fair
+        // traversal during one whole-pool prepopulation/verification pass.
+        for (size_t banks : {size_t{4}, size_t{32}, size_t{256}}) {
+            for (int depth : {1, 2, 4}) {
+                for (int iterations : {0, 1, 3, 4, 5, 33, 259, static_cast<int>(banks)}) {
+                    MockTransfers reused(banks);
+                    check(reused.run(depth, iterations, -1, true));
+                    check(reused.issued == iterations && reused.completed == iterations);
+                    check(reused.in_flight == 0);
+                    check(reused.peak == static_cast<size_t>(std::min(depth, iterations)));
+                    if (iterations == static_cast<int>(banks)) {
+                        for (int visits : reused.visits) {
+                            check(visits == 1);
+                        }
+                    }
+                }
+            }
+        }
+        MockTransfers nondivisible(6);
+        check(!nondivisible.run(4, 20, -1, true));
+        check(nondivisible.issued == 0);
+        for (int fail_at : {0, 1, 5}) {
+            MockTransfers post_error(8);
+            post_error.fail_post = fail_at;
+            check(!post_error.run(2, 20, -1, true));
+            check(post_error.issued == fail_at);
+            MockTransfers poll_error(8);
+            poll_error.fail_poll = fail_at;
+            check(!poll_error.run(2, 20, -1, true));
+            check(poll_error.completed == fail_at);
+            MockTransfers cancelled(8);
+            check(!cancelled.run(2, 20, fail_at, true));
+            check(cancelled.completed == fail_at);
         }
         MockTransfers independent(8);
         check(independent.run(2, 80));

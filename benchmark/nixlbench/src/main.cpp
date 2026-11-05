@@ -20,6 +20,7 @@
 #include <nixl.h>
 #include <sys/time.h>
 #include "utils/utils.h"
+#include "utils/memos_buffer.h"
 #if HAVE_RAW_CLI
 #include "utils/raw_cli.h"
 #endif
@@ -92,6 +93,15 @@ static std::vector<std::vector<xferBenchIOV>> createTransferDescLists(xferBenchW
 
                 for (size_t j = 0; j < batch_size; j++) {
                     size_t block_offset = ((j * block_size) % iov.len);
+                    if (xferBenchConfig::memos_reuse_local) {
+                        // Reuse is validated as single-device SG/pairwise only.
+                        if (count != 1) {
+                            throw std::invalid_argument("MEMOS reuse requires one local region");
+                        }
+                        block_offset = nixlbench::memosLocalBufferOffset(
+                            j, block_size, xferBenchConfig::max_batch_size,
+                            xferBenchConfig::pipeline_depth, iov.len);
+                    }
                     if (block_offset + block_size > iov.len) {
                         // Prevent memory overflow when iov.len is not divisible by block_size
                         block_offset = 0;

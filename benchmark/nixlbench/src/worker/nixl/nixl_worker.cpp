@@ -1964,7 +1964,8 @@ execTransferLoop(nixlAgent *agent,
                     slot.in_flight = false;
                     return nixlbench::MemosBatchStatus::complete;
                 },
-                [&] { return terminate_ptr && terminate_ptr->load(); });
+                [&] { return terminate_ptr && terminate_ptr->load(); },
+                xferBenchConfig::memos_reuse_local);
             cleanupSlots(agent, backend_engine, banks);
             return success ? 0 : -1;
         }

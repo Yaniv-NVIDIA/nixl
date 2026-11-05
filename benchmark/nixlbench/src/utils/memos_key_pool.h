@@ -30,13 +30,25 @@ parseMemosKeyPoolSize(const char *value) {
     return count;
 }
 
+inline bool
+parseMemosReuseLocal(const char *value) {
+    if (value == nullptr || std::string_view(value) == "0") {
+        return false;
+    }
+    if (std::string_view(value) == "1") {
+        return true;
+    }
+    throw std::invalid_argument("NIXLBENCH_REUSE_LOCAL must be 0 or 1");
+}
+
 inline void
 validateMemosKeyPoolSize(size_t keys,
                          size_t batch,
                          size_t max_block_size,
                          size_t total_buffer_size,
                          size_t threads,
-                         int pipeline_depth = 1) {
+                         int pipeline_depth = 1,
+                         bool reuse_local = false) {
     if (batch == 0 || keys < batch || keys % batch != 0) {
         throw std::invalid_argument("key count must be a positive multiple of batch size");
     }
@@ -47,8 +59,13 @@ validateMemosKeyPoolSize(size_t keys,
     if (threads == 0 || keys > static_cast<size_t>(std::numeric_limits<int>::max()) / threads) {
         throw std::invalid_argument("total key count exceeds the descriptor ID range");
     }
-    if (max_block_size == 0 || keys > (total_buffer_size / threads) / max_block_size) {
-        throw std::invalid_argument("key pool exceeds the per-thread buffer at max_block_size");
+    if (reuse_local && (keys / batch) % static_cast<size_t>(pipeline_depth) != 0) {
+        throw std::invalid_argument("reuse requires key-pool banks divisible by pipeline depth");
+    }
+    // Depth is bounded by keys / batch above, so this multiplication cannot overflow.
+    const size_t local_values = reuse_local ? batch * static_cast<size_t>(pipeline_depth) : keys;
+    if (max_block_size == 0 || local_values > (total_buffer_size / threads) / max_block_size) {
+        throw std::invalid_argument("local values exceed the per-thread buffer at max_block_size");
     }
 }
 
