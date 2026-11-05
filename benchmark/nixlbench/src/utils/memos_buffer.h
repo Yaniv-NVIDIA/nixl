@@ -26,10 +26,8 @@ memosLocalBufferOffset(size_t key_index,
     if (block_size == 0 || slots > allocation_size / block_size) {
         throw std::invalid_argument("MEMOS local buffer is smaller than batch * depth values");
     }
-    const size_t logical_size = slots * block_size;
-    if (allocation_size != logical_size) {
-        throw std::invalid_argument("MEMOS reuse requires an exact local buffer size");
-    }
+    // Extra allocation bytes (including hugepage padding) are not extra slots.
+    // Wrap at the logical batch * depth ring, independent of allocation size.
     return (key_index % slots) * block_size;
 }
 

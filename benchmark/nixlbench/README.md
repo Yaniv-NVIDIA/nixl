@@ -1285,9 +1285,14 @@ Each lane keeps its local buffers until completion and advances through its
 own key banks. Fixed per-lane iteration budgets ensure prepopulation and the
 retrieval check visit every key despite out-of-order completions. At the end
 of a phase, a fast lane may drain before a slower lane finishes its budget.
-Native iteration counts, timing and statistics are unchanged. Initially,
-reuse requires the local region to exactly match the current block size times
-batch size times depth; padded allocations are rejected.
+Native iteration counts, timing and statistics are unchanged.
+
+Each local region must hold at least `max_block_size * batch_size * pipeline_depth`
+bytes. Extra bytes, including hugepage allocation padding, are left unused:
+address wrapping uses exactly `block_size * batch_size * pipeline_depth` bytes
+for the current value size. Values such as 508 and 1020 KiB retain their exact
+sizes; they are not rounded to 512 or 1024 KiB. Larger buffers and block-size
+sweeps use the same logical slot mapping.
 
 Existing
 random 128-bit object keys remain independent across threads and runs. Unset the
