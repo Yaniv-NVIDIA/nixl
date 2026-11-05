@@ -31,7 +31,7 @@ struct Simulation {
 
     Simulation(size_t banks, int d, bool r): depth(d), reuse(r), remaining(banks),
                                            posting(banks), visits(banks) {}
-    bool run(uint64_t warmup = 40, uint64_t duration = 300) {
+    bool run(uint64_t warmup = 40, uint64_t duration = 300, nixlbench::MemosDurationWorkspace *workspace = nullptr) {
         return nixlbench::runMemosDurationPipeline(
             remaining.size(), depth, reuse, 0, warmup, duration,
             [&](size_t bank) {
@@ -64,7 +64,7 @@ struct Simulation {
                 ++completed;
             },
             [&] { return clock++; },
-            [&] { return cancel_after >= 0 && completed >= cancel_after; }, stats);
+            [&] { return cancel_after >= 0 && completed >= cancel_after; }, stats, workspace);
     }
 };
 }
@@ -143,11 +143,50 @@ int main() {
         check(aggregate.window_end_us-aggregate.window_start_us==300);
         check(aggregate.measured_batches==a.stats.measured_batches+b.stats.measured_batches);
         check(aggregate.workers==2 && aggregate.workers_with_completions==2);
+        check(nixlbench::validDurationStats(aggregate,2));
+        auto mismatch = b.stats;
+        ++mismatch.window_start_us;
+        auto rejected = a.stats;
+        rejected.add(mismatch);
+        check(!rejected.valid && !nixlbench::validDurationStats(rejected,1));
+        auto overflow = a.stats;
+        overflow.issued_batches = std::numeric_limits<uint64_t>::max();
+        overflow.add(b.stats);
+        check(!overflow.valid);
+        auto wrong_sum = aggregate;
+        ++wrong_sum.completed_batches;
+        check(!nixlbench::validDurationStats(wrong_sum,2));
+        auto wrong_workers = aggregate;
+        check(!nixlbench::validDurationStats(wrong_workers,3));
+        for (int limit : {0,-1,1000001}) reject([&] { nixlbench::validateDurationSampleLimit(limit); });
+        nixlbench::validateDurationSampleLimit(1);
+        nixlbench::validateDurationSampleLimit(65536);
+        nixlbench::MemosDurationWorkspace prepared(16,2);
+        Simulation ready(16,2,true);
+        auto *active_storage = prepared.active.data();
+        auto *timestamp_storage = prepared.posted_at.data();
+        check(ready.run(40,300,&prepared));
+        check(prepared.active.data()==active_storage && prepared.posted_at.data()==timestamp_storage);
+        const int already_issued = ready.issued;
+        check(!ready.run(40,300,&prepared) && ready.issued == already_issued);
+        nixlbench::MemosDurationWorkspace bad_shape(16,4);
+        Simulation invalid_workspace(16,2,true);
+        check(!invalid_workspace.run(40,300,&bad_shape));
         for (int depth : {-1,0,9}) {
             Simulation s(8,depth,true);check(!s.run());check(s.issued==0);
         }
         Simulation nondivisible(6,4,true);check(!nondivisible.run());
         Simulation zero(8,2,true);check(!zero.run(0,0));
+        int callbacks = 0;
+        nixlbench::MemosDurationStats impossible;
+        check(!nixlbench::runMemosDurationPipeline(1,1,true,
+            std::numeric_limits<uint64_t>::max()-5,10,30,
+            [&](size_t) { ++callbacks;return true; },
+            [&](size_t) { ++callbacks;return nixlbench::MemosBatchStatus::complete; },
+            [&](size_t,bool) { ++callbacks; }, [] { return uint64_t{0}; },
+            [] { return false; },impossible));
+        check(callbacks==0);
+
         std::cout << "MEMOS duration tests passed: boundaries, unequal lane rates, drain, errors, cancellation, aggregation\n";
     } catch (const std::exception &e) { std::cerr<<e.what()<<'\n';return 1; }
 }

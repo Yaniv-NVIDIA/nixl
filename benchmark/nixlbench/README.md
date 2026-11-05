@@ -1329,6 +1329,21 @@ latency. Completions are timed at polling observation, not by device timestamps.
 The `STEADY_STATE` record reports actual measured batches, I/Os and bytes,
 window timestamps, warmup and drain completions, drain time, issued/completed
 counts, worker coverage, and the sum of per-worker API batch peaks. That peak
-is not an NVMe hardware queue-depth measurement. As with iteration mode,
-latency statistics are collected in memory; very long/high-rate runs can grow
-these sample vectors. No result is emitted if the window has no completions.
+is not an NVMe hardware queue-depth measurement. Duration mode bounds latency sample storage with
+`--duration_latency_samples=65536` (per worker, separately for post and transfer
+latencies; valid range 1–1,000,000). Storage and pipeline bookkeeping are
+allocated and touched before the common timer starts. Every in-window
+completion still counts toward throughput, even after the latency sample limit
+is reached. Means and percentiles pool the first N eligible samples from each
+worker; they are not a weighted or uniform sample of a longer complete window.
+The `latency_samples`, `post_samples`, `latency_sample_limit`, and
+`latency_samples_truncated` fields disclose this policy and any truncation.
+`post_eligible_batches`, `post_samples_truncated`, and
+`transfer_samples_truncated` distinguish the two latency sample streams.
+Increase the limit when a longer/high-rate run needs more latency samples.
+No result is emitted if the window has no completions or its worker/window/
+counter accounting is inconsistent. MEMOS prepopulation also rejects an OpenMP
+team smaller than requested, preventing a partial key-pool check from being
+reported as complete. Deferred request cancellation retains the handle and
+buffers while driving progress until the backend accepts release. The point's
+external watchdog remains necessary for a permanently stalled backend.

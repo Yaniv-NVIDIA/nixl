@@ -180,6 +180,8 @@ NB_ARG_INT32(large_blk_iter_ftr,
 NB_ARG_INT32(warmup_iter, 100, "Number of warmup iterations before timing");
 NB_ARG_INT32(warmup_seconds, 0, "Continuous timed warmup before duration measurement");
 NB_ARG_INT32(duration_seconds, 0, "Steady-state measurement seconds; 0 retains iteration mode");
+NB_ARG_INT32(duration_latency_samples, 65536,
+             "Maximum post/transfer latency samples per worker in duration mode");
 NB_ARG_INT32(num_threads,
              1,
              "Number of threads used by benchmark."
@@ -390,6 +392,7 @@ int xferBenchConfig::large_blk_iter_ftr = 16;
 int xferBenchConfig::warmup_iter = 0;
 int xferBenchConfig::warmup_seconds = 0;
 int xferBenchConfig::duration_seconds = 0;
+int xferBenchConfig::duration_latency_samples = 65536;
 int xferBenchConfig::num_threads = 0;
 bool xferBenchConfig::enable_pt = false;
 size_t xferBenchConfig::progress_threads = 0;
@@ -825,15 +828,16 @@ xferBenchConfig::loadParams(void) {
     max_block_size = NB_ARG(max_block_size);
     start_batch_size = NB_ARG(start_batch_size);
     max_batch_size = NB_ARG(max_batch_size);
+    warmup_seconds = NB_ARG(warmup_seconds);
+    duration_seconds = NB_ARG(duration_seconds);
+    duration_latency_samples = NB_ARG(duration_latency_samples);
     num_iter = NB_ARG(num_iter);
-    if (num_iter < 1) {
+    if (duration_seconds == 0 && num_iter < 1) {
         std::cerr << "num_iter must be >= 1" << std::endl;
         return -1;
     }
     large_blk_iter_ftr = NB_ARG(large_blk_iter_ftr);
     warmup_iter = NB_ARG(warmup_iter);
-    warmup_seconds = NB_ARG(warmup_seconds);
-    duration_seconds = NB_ARG(duration_seconds);
     num_threads = NB_ARG(num_threads);
     pipeline_depth = NB_ARG(pipeline_depth);
     if (pipeline_depth < 1) {
@@ -947,6 +951,7 @@ xferBenchConfig::loadParams(void) {
 
     try {
         nixlbench::validateDurationSeconds(warmup_seconds, duration_seconds);
+        if (duration_seconds > 0) nixlbench::validateDurationSampleLimit(duration_latency_samples);
         memos_keys_per_thread =
             nixlbench::parseMemosKeyPoolSize(std::getenv("NIXLBENCH_MEMOS_KEYS_PER_THREAD"));
         memos_reuse_local =
@@ -1045,23 +1050,26 @@ xferBenchConfig::loadParams(void) {
         return -1;
     }
 
-    if (large_blk_iter_ftr <= 0) {
+    if (duration_seconds == 0 && large_blk_iter_ftr <= 0) {
         std::cerr << "iter_factor must be greater than 0" << std::endl;
         return -1;
     }
 
-    int partition = (workers * large_blk_iter_ftr);
-    if (num_iter % partition) {
-        num_iter += partition - (num_iter % partition);
-        std::cout << "WARNING: Adjusting num_iter to " << num_iter
-                  << " to allow equal distribution to " << workers << " " << worker_kind
-                  << std::endl;
-    }
-    if (warmup_iter % partition) {
-        warmup_iter += partition - (warmup_iter % partition);
-        std::cout << "WARNING: Adjusting warmup_iter to " << warmup_iter
-                  << " to allow equal distribution to " << workers << " " << worker_kind
-                  << std::endl;
+    int partition = 0;
+    if (duration_seconds == 0) {
+        partition = (workers * large_blk_iter_ftr);
+        if (num_iter % partition) {
+            num_iter += partition - (num_iter % partition);
+            std::cout << "WARNING: Adjusting num_iter to " << num_iter
+                      << " to allow equal distribution to " << workers << " " << worker_kind
+                      << std::endl;
+        }
+        if (warmup_iter % partition) {
+            warmup_iter += partition - (warmup_iter % partition);
+            std::cout << "WARNING: Adjusting warmup_iter to " << warmup_iter
+                      << " to allow equal distribution to " << workers << " " << worker_kind
+                      << std::endl;
+        }
     }
     partition = (num_initiator_dev * workers);
     if (total_buffer_size % partition) {
@@ -1133,6 +1141,8 @@ xferBenchConfig::printConfig() {
         printOption("Pipeline depth (--pipeline_depth=N)", std::to_string(pipeline_depth));
         printOption("Warmup seconds (--warmup_seconds=N)", std::to_string(warmup_seconds));
         printOption("Duration seconds (--duration_seconds=N)", std::to_string(duration_seconds));
+        printOption("Duration latency sample limit (--duration_latency_samples=N)",
+                    std::to_string(duration_latency_samples));
         printOption("Use hugepages (--use_hugepages=[0,1])", std::to_string(use_hugepages));
 
         // Print GDS options if backend is GDS
@@ -1686,31 +1696,43 @@ xferBenchUtils::printStats(bool is_target,
     double avg_latency = 0, throughput_gb = 0;
     double totalbw = 0;
 
-    int total_iter = xferBenchConfig::num_iter;
-    int per_thread_iter = total_iter / xferBenchConfig::workerNum();
-
-    if (block_size > LARGE_BLOCK_SIZE) {
-        total_iter /= xferBenchConfig::large_blk_iter_ftr;
-        per_thread_iter /= xferBenchConfig::large_blk_iter_ftr;
-    }
-
     // Targets don't participate in reduction - they have no throughput to contribute
     if (is_target && IS_PAIRWISE_AND_SG() && rt->getSize() > 2) {
         return;
     }
 
-    const bool duration_mode = stats.duration.window_end_us != 0;
+    const bool duration_mode = xferBenchConfig::duration_seconds > 0 ||
+                               stats.duration.window_end_us != 0 || !stats.duration.valid;
     double total_duration = stats.total_duration.avg();
+    if (!duration_mode) {
+        int total_iter = xferBenchConfig::num_iter;
+        int per_thread_iter = total_iter / xferBenchConfig::workerNum();
 
-    total_data_transferred = ((block_size * batch_size) * total_iter); // In Bytes
-    avg_latency = (total_duration / (per_thread_iter * batch_size)); // In microsec
-    if (IS_PAIRWISE_AND_MG() || IS_MANY_TO_ONE_AND_MG() ||
-        (IS_PAIRWISE_AND_SG() && xferBenchConfig::num_initiator_dev > 1 && rt->getSize() == 1)) {
-        total_data_transferred *= xferBenchConfig::num_initiator_dev; // In Bytes
-        avg_latency /= xferBenchConfig::num_initiator_dev; // In microsec
+        if (block_size > LARGE_BLOCK_SIZE) {
+            total_iter /= xferBenchConfig::large_blk_iter_ftr;
+            per_thread_iter /= xferBenchConfig::large_blk_iter_ftr;
+        }
+
+        total_data_transferred = ((block_size * batch_size) * total_iter); // In Bytes
+        avg_latency = (total_duration / (per_thread_iter * batch_size)); // In microsec
+        if (IS_PAIRWISE_AND_MG() || IS_MANY_TO_ONE_AND_MG() ||
+            (IS_PAIRWISE_AND_SG() && xferBenchConfig::num_initiator_dev > 1 && rt->getSize() == 1)) {
+            total_data_transferred *= xferBenchConfig::num_initiator_dev; // In Bytes
+            avg_latency /= xferBenchConfig::num_initiator_dev; // In microsec
+        }
+
     }
 
     if (duration_mode) {
+        if (!nixlbench::validDurationStats(stats.duration, xferBenchConfig::num_threads) ||
+            stats.duration.latency_samples != stats.transfer_duration.count() ||
+            stats.duration.post_samples != stats.post_duration.count() ||
+            stats.duration.window_end_us - stats.duration.window_start_us !=
+                static_cast<uint64_t>(xferBenchConfig::duration_seconds) * 1000000 ||
+            stats.duration.window_start_us <
+                static_cast<uint64_t>(xferBenchConfig::warmup_seconds) * 1000000) {
+            throw std::invalid_argument("invalid duration-mode measurement counters/window");
+        }
         total_data_transferred = nixlbench::completedBytes(
             stats.duration.measured_batches, batch_size, block_size);
         total_duration = stats.duration.window_end_us - stats.duration.window_start_us;
@@ -1735,6 +1757,17 @@ xferBenchUtils::printStats(bool is_target,
                   << " issued_batches=" << stats.duration.issued_batches
                   << " completed_batches=" << stats.duration.completed_batches
                   << " latency_batches=" << stats.duration.latency_batches
+                  << " latency_samples=" << stats.duration.latency_samples
+                  << " post_samples=" << stats.duration.post_samples
+                  << " post_eligible_batches=" << stats.duration.post_eligible_batches
+                  << " latency_sample_limit=" << xferBenchConfig::duration_latency_samples
+                  << " latency_samples_truncated="
+                  << (stats.duration.latency_samples < stats.duration.latency_batches ||
+                      stats.duration.post_samples < stats.duration.post_eligible_batches ? 1 : 0)
+                  << " transfer_samples_truncated="
+                  << (stats.duration.latency_samples < stats.duration.latency_batches ? 1 : 0)
+                  << " post_samples_truncated="
+                  << (stats.duration.post_samples < stats.duration.post_eligible_batches ? 1 : 0)
                   << " sum_worker_peak_batches=" << stats.duration.peak_batches << std::endl;
     }
     throughput_gb = (((double)total_data_transferred / (1000 * 1000 * 1000)) /
@@ -2207,6 +2240,18 @@ void
 xferMetricStats::reserve(size_t n) {
     samples.reserve(n);
 }
+
+void xferMetricStats::preallocate(size_t n) {
+    samples.resize(n);
+    // Volatile stores ensure that allocation and first-touch faults cannot be
+    // optimized into the timed phase. One store per 4 KiB plus the last entry covers 4 KiB and larger pages.
+    volatile double *data = samples.data();
+    for (size_t i = 0; i < n; i += 4096 / sizeof(double)) data[i] = 0;
+    if (n != 0) data[n-1] = 0; // Also touch the final page of an unaligned allocation.
+    samples.clear();
+}
+
+size_t xferMetricStats::count() const { return samples.size(); }
 
 void
 xferMetricStats::clear() {

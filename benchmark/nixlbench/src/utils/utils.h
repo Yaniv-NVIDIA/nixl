@@ -192,6 +192,7 @@ public:
     static int warmup_iter;
     static int warmup_seconds;
     static int duration_seconds;
+    static int duration_latency_samples;
     static int num_threads;
     static bool enable_pt;
     static size_t progress_threads;
@@ -353,6 +354,9 @@ public:
     add(const xferMetricStats &other);
     void
     reserve(size_t n);
+    // Reserve and fault in sample storage before a duration-mode window.
+    void preallocate(size_t n);
+    size_t count() const;
     void
     clear();
 
