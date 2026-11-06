@@ -712,6 +712,51 @@ TEST_F(DocMemosBackendTest, QueryMemActualMixed) {
                             [](uint32_t flags) { return flags == DOCA_TASK_SUBMIT_FLAG_NONE; }));
 }
 
+// The second EXIST is queued on DOCA_ERROR_FULL and then fails permanently on
+// retry. Completion must not be published until the retry loop has taken the
+// request off the pending queue, since queryMem() frees it on completion.
+static void
+queryWithFailedRetry(nixlBackendEngine &engine) {
+    auto &mock = DocaMockControl::instance();
+    {
+        auto lk = DocaMockControl::lock();
+        mock.auto_complete_tasks = true;
+        mock.task_submit_fail_after_n = 1;
+        mock.task_submit_call_count = 0;
+        mock.task_alloc_fail_after_n = 2;
+        mock.task_alloc_call_count = 0;
+        mock.task_alloc_fail_error = DOCA_ERROR_IO_FAILED;
+    }
+
+    nixl_reg_dlist_t reg_dlist(OBJ_SEG);
+    for (const char *name : {"first", "second"}) {
+        nixlBlobDesc desc;
+        desc.devId = 810;
+        desc.metaInfo = hexKey(name);
+        reg_dlist.addDesc(desc);
+    }
+
+    std::vector<nixl_query_resp_t> resp;
+    EXPECT_EQ(engine.queryMem(reg_dlist, resp), NIXL_ERR_BACKEND);
+    EXPECT_EQ(mock.task_alloc_call_count, 3);
+}
+
+TEST_F(DocMemosBackendTest, QueryMemQueuedExistFailsOnRetry) {
+    setupInitParams(false);
+    createEngine();
+    queryWithFailedRetry(*engine_);
+}
+
+TEST_F(DocMemosBackendTest, QueryMemQueuedExistFailsOnRetry_Threaded) {
+    setupInitParams(true);
+    createEngine();
+    // The progress thread races queryMem() returning, so repeat to give ASan
+    // a chance to catch a write to a freed request.
+    for (int i = 0; i < 200; i++) {
+        queryWithFailedRetry(*engine_);
+    }
+}
+
 // ============================================================================
 // Threading Mode Tests
 // ============================================================================
@@ -1855,6 +1900,39 @@ TEST_F(DocMemosBackendTest, ReleaseInFlightRequest) {
     EXPECT_EQ(engine_->releaseReqH(handle), NIXL_SUCCESS);
 
     for (int i = 0; i < 3; i++) {
+        free(x.buffers[i]);
+        engine_->deregisterMem(x.mds[i]);
+    }
+}
+
+// A handle from prepXfer() that was never posted has nothing to complete it,
+// so releasing it must free it immediately.
+static void
+releaseUnposted(xferBuffers &x, nixlBackendEngine &engine) {
+    nixlBackendReqH *handle = nullptr;
+    ASSERT_EQ(engine.prepXfer(NIXL_WRITE, x.local, x.remote, "", handle), NIXL_SUCCESS);
+    EXPECT_EQ(engine.releaseReqH(handle), NIXL_SUCCESS);
+    EXPECT_EQ(DocaMockControl::instance().task_submit_ex_call_count, 0);
+}
+
+TEST_F(DocMemosBackendTest, ReleaseUnpostedRequest) {
+    createEngine();
+    xferBuffers x;
+    buildXfer(x, 2, 30500, "unposted_key_");
+    releaseUnposted(x, *engine_);
+    for (int i = 0; i < 2; i++) {
+        free(x.buffers[i]);
+        engine_->deregisterMem(x.mds[i]);
+    }
+}
+
+TEST_F(DocMemosBackendTest, ReleaseUnpostedRequest_Threaded) {
+    setupInitParams(true);
+    createEngine();
+    xferBuffers x;
+    buildXfer(x, 2, 30600, "unposted_key_");
+    releaseUnposted(x, *engine_);
+    for (int i = 0; i < 2; i++) {
         free(x.buffers[i]);
         engine_->deregisterMem(x.mds[i]);
     }

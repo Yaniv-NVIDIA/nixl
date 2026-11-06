@@ -163,6 +163,8 @@ protected:
     static void
     handleSubmissionFailure(nixlDocaMemosBackendReqH *req_h, nixl_status_t status);
     static void
+    publishIfComplete(nixlDocaMemosBackendReqH *req_h);
+    static void
     dropUnsubmittedTasks(nixlDocaMemosBackendReqH *req_h);
 
     struct doca_pe *pe_ = nullptr;

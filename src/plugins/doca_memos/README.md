@@ -32,6 +32,12 @@ The DOCA_MEMOS plugin enables high-performance key-value operations (store, retr
   - `libdoca_common` - DOCA Core library
   - `libdoca_kv` also provides the NVMe kernel device backend
   - `libb2` - Blake2 hashing used by optional string-to-128-bit key conversion
+- **Hugepages**: `DRAM_SEG` buffers must be backed by hugepages. The NVMe
+  kernel device hands buffers to the kernel NVMe driver by user address, and
+  a value spread across 4 KiB pages can exceed the device's per-command
+  segment limit. Reserve 2 MiB hugepages before starting the application,
+  for example `sysctl vm.nr_hugepages=1024`, and allocate buffers with
+  `mmap(MAP_HUGETLB)` as shown in the [Usage Example](#usage-example).
 
 ## Configuration
 
@@ -177,6 +183,8 @@ Releases the metadata object returned by `registerMem()`. Does not delete data f
 ## Usage Example
 
 ```cpp
+#include <sys/mman.h>
+#include <cstring>
 #include "nixl.h"
 
 // Create agent
@@ -195,13 +203,27 @@ remote_desc.devId = 100;
 remote_desc.metaInfo = "636b70745f30303031";
 agent.registerMem(remote_desc, OBJ_SEG);
 
-// Register DRAM_SEG memory for local buffer
-char buffer[4096] = "checkpoint data";
+// DRAM_SEG buffers must be backed by hugepages. Register one 2 MiB hugepage
+// and use its first 4 KiB for the write and its second 4 KiB for the read.
+const size_t hugepage_len = 2 * 1024 * 1024;
+void *hugepage = mmap(nullptr, hugepage_len, PROT_READ | PROT_WRITE,
+                      MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB, -1, 0);
+if (hugepage == MAP_FAILED) {
+    // No free hugepages; raise vm.nr_hugepages
+    return -1;
+}
+nixlBlobDesc dram_desc;
+dram_desc.devId = 0;
+dram_desc.baseAddr = reinterpret_cast<uint64_t>(hugepage);
+dram_desc.length = hugepage_len;
+agent.registerMem(dram_desc, DRAM_SEG);
+
+char *buffer = static_cast<char *>(hugepage);
+strcpy(buffer, "checkpoint data");
 nixlBlobDesc local_desc;
 local_desc.devId = 0;
 local_desc.baseAddr = reinterpret_cast<uint64_t>(buffer);
 local_desc.length = 4096;
-agent.registerMem(local_desc, DRAM_SEG);
 
 // Create descriptor lists
 auto local_dlist = agent.createDlist({local_desc}, DRAM_SEG);
@@ -223,7 +245,7 @@ if (status == NIXL_SUCCESS && query_results[0].has_value()) {
 }
 
 // Read data from key
-char read_buffer[4096] = {0};
+char *read_buffer = buffer + 4096;
 local_desc.baseAddr = reinterpret_cast<uint64_t>(read_buffer);
 local_dlist = agent.createDlist({local_desc}, DRAM_SEG);
 
@@ -235,7 +257,8 @@ agent.releaseReqH(read_handle);
 
 // Cleanup
 agent.deregisterMem(remote_desc);
-agent.deregisterMem(local_desc);
+agent.deregisterMem(dram_desc);
+munmap(hugepage, hugepage_len);
 ```
 
 ## Performance Considerations

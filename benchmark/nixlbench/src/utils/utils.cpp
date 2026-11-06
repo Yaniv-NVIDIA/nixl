@@ -144,7 +144,7 @@ NB_ARG_STRING(runtime_type,
 NB_ARG_STRING(worker_type, XFERBENCH_WORKER_NIXL, "Type of worker [nixl, nvshmem]");
 NB_ARG_STRING(backend,
               XFERBENCH_BACKEND_UCX,
-              "Name of NIXL backend [UCX, GDS, GDS_MT, POSIX, GPUNETIO, Mooncake, HF3FS, OBJ, "
+              "Name of NIXL backend [UCX, GDS, GDS_MT, POSIX, GPUNETIO, MOONCAKE, HF3FS, OBJ, "
               "REDIS, GUSLI, AZURE_BLOB, DOCA_MEMOS] (only used with nixl worker)");
 NB_ARG_STRING(initiator_seg_type,
               XFERBENCH_SEG_TYPE_DRAM,
@@ -465,7 +465,17 @@ validateDeviceAPIConfig() {
         std::cerr << "Invalid configuration for NIXL Device API: " << reason << std::endl;
         return false;
     };
-#ifdef HAVE_UCX_GPU_DEVICE_API
+#ifdef NIXLBENCH_DEVICE_API
+    const bool proxy = xferBenchConfig::device_mode == XFERBENCH_DEVICE_MODE_PROXY;
+    if (!proxy && xferBenchConfig::device_mode != XFERBENCH_DEVICE_MODE_DIRECT) {
+        return reject("device_mode must be direct or proxy");
+    }
+#ifndef HAVE_UCX_GPU_DEVICE_API
+    if (!proxy) {
+        return reject("device_mode=direct needs UCX GPU Device API support, which is not enabled "
+                      "in this build; set -Ducx_path=<path> with UCX GPU device headers available");
+    }
+#endif
     if (xferBenchConfig::worker_type != XFERBENCH_WORKER_NIXL) {
         return reject("worker_type must be nixl");
     }
@@ -478,10 +488,6 @@ validateDeviceAPIConfig() {
     if (xferBenchConfig::initiator_seg_type != XFERBENCH_SEG_TYPE_VRAM ||
         xferBenchConfig::target_seg_type != XFERBENCH_SEG_TYPE_VRAM) {
         return reject("initiator_seg_type and target_seg_type must be VRAM");
-    }
-    const bool proxy = xferBenchConfig::device_mode == XFERBENCH_DEVICE_MODE_PROXY;
-    if (!proxy && xferBenchConfig::device_mode != XFERBENCH_DEVICE_MODE_DIRECT) {
-        return reject("device_mode must be direct or proxy");
     }
     if (proxy) {
         if (xferBenchConfig::progress_threads != 0) {
@@ -510,8 +516,7 @@ validateDeviceAPIConfig() {
     }
     return true;
 #else
-    return reject("UCX GPU Device API support is not enabled in this build. "
-                  "Set -Ducx_path=<path> with UCX GPU device headers available");
+    return reject("NIXL Device API support is not enabled in this build");
 #endif
 }
 
@@ -549,6 +554,13 @@ setupDeviceAPIConfig() {
                   << xferBenchConfig::device_channel_num << " to Device API group number "
                   << group_num << std::endl;
         xferBenchConfig::device_channel_num = group_num;
+    }
+    if ((group_num % xferBenchConfig::device_channel_num) != 0) {
+        std::cerr << "Invalid value for --device_channel_num: "
+                  << xferBenchConfig::device_channel_num
+                  << ". nixlbench requires Device API group number " << group_num
+                  << " to be a multiple of the channel number" << std::endl;
+        return false;
     }
     if (xferBenchConfig::num_iter < group_num) {
         std::cerr << "Invalid value for --num_iter: " << xferBenchConfig::num_iter
@@ -844,6 +856,12 @@ xferBenchConfig::loadParams(void) {
         std::cerr << "pipeline_depth must be >= 1" << std::endl;
         return -1;
     }
+    // execQuery() issues the whole batch_size * pipeline_depth descriptor list
+    // as one synchronous queryMem() call, while the stats count batch_size.
+    if (op_type == XFERBENCH_OP_QUERY && pipeline_depth != 1) {
+        std::cerr << "QUERY requires pipeline_depth=1" << std::endl;
+        return -1;
+    }
     use_device_api = NB_ARG(use_device_api);
     device_channel_num = NB_ARG(device_channel_num);
     device_mode = NB_ARG(device_mode);
@@ -1121,7 +1139,7 @@ xferBenchConfig::printConfig() {
     printOption("Worker type (--worker_type=[nixl,nvshmem])", worker_type);
     if (worker_type == XFERBENCH_WORKER_NIXL) {
         printOption(
-            "Backend (--backend=[UCX,GDS,GDS_MT,POSIX,Mooncake,HF3FS,OBJ,REDIS,GUSLI,AZURE_BLOB,"
+            "Backend (--backend=[UCX,GDS,GDS_MT,POSIX,MOONCAKE,HF3FS,OBJ,REDIS,GUSLI,AZURE_BLOB,"
             "DOCA_MEMOS])",
             backend);
         printOption("Enable pt (--enable_pt=[0,1])", std::to_string(enable_pt));

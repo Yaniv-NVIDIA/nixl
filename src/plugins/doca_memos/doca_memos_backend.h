@@ -81,6 +81,7 @@ public:
           allTasksCompleted_(other.allTasksCompleted_.load(std::memory_order_relaxed)),
           cancelled_(other.cancelled_.load(std::memory_order_relaxed)),
           abortQueued_(other.abortQueued_),
+          posted_(other.posted_),
           overallStatus_(other.overallStatus_),
           taskResult_(other.taskResult_.load(std::memory_order_relaxed)),
           isExistQuery_(other.isExistQuery_),
@@ -125,6 +126,9 @@ private:
     std::atomic<bool> cancelled_{false};
     // Threaded engine only, guarded by its queueMutex_.
     bool abortQueued_ = false;
+    // Set by postXfer(). An unposted request has nothing to complete it, so
+    // releaseRequest() frees it immediately.
+    bool posted_ = false;
     nixl_status_t overallStatus_ = NIXL_IN_PROG;
     std::atomic<int> taskResult_{0};
     bool isExistQuery_ = false;

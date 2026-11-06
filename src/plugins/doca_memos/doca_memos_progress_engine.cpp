@@ -55,8 +55,19 @@ nixlDocaMemosProgressEngine::handleSubmissionFailure(nixlDocaMemosBackendReqH *r
     // callbacks. Adjust totalTasks_ so the in-flight tasks plus this failure
     // can reach the completion threshold.
     req_h->totalTasks_ = req_h->submittedTasks_ + 1;
+    req_h->completedTasks_++;
 
-    if (++req_h->completedTasks_ >= req_h->totalTasks_) {
+    // The owner may free the request as soon as it observes completion, so a
+    // request still on pendingRequests_ is published by the retry loop after
+    // it has been dequeued.
+    if (!req_h->isPending_) {
+        publishIfComplete(req_h);
+    }
+}
+
+void
+nixlDocaMemosProgressEngine::publishIfComplete(nixlDocaMemosBackendReqH *req_h) {
+    if (req_h->completedTasks_ >= req_h->totalTasks_) {
         req_h->allTasksCompleted_.store(true, std::memory_order_release);
     }
 }
@@ -64,9 +75,7 @@ nixlDocaMemosProgressEngine::handleSubmissionFailure(nixlDocaMemosBackendReqH *r
 void
 nixlDocaMemosProgressEngine::dropUnsubmittedTasks(nixlDocaMemosBackendReqH *req_h) {
     req_h->totalTasks_ = req_h->submittedTasks_;
-    if (req_h->completedTasks_ >= req_h->totalTasks_) {
-        req_h->allTasksCompleted_.store(true, std::memory_order_release);
-    }
+    publishIfComplete(req_h);
 }
 
 void
@@ -567,6 +576,7 @@ nixlNoThreadProgressEngine::postXfer(nixlDocaMemosBackendReqH *req_h,
     req_h->allTasksCompleted_.store(false, std::memory_order_release);
     req_h->cancelled_.store(false, std::memory_order_relaxed);
     req_h->overallStatus_ = NIXL_IN_PROG;
+    req_h->posted_ = true;
 
     NIXL_DEBUG << "Posting transfer with " << req_h->totalTasks_ << " tasks";
 
@@ -622,6 +632,7 @@ nixlNoThreadProgressEngine::tryResumePendingRequests() const {
 
         pendingRequests_.pop_front();
         req_h->isPending_ = false;
+        publishIfComplete(req_h);
     }
 
     flushSubmittedTasks(tasks_queued);
@@ -630,6 +641,11 @@ nixlNoThreadProgressEngine::tryResumePendingRequests() const {
 nixl_status_t
 nixlNoThreadProgressEngine::releaseRequest(nixlDocaMemosBackendReqH *req_h) const {
     NIXL_LOCK_GUARD(lock_);
+
+    if (!req_h->posted_) {
+        delete req_h;
+        return NIXL_SUCCESS;
+    }
 
     if (req_h->isPending_) {
         auto it = std::find(pendingRequests_.begin(), pendingRequests_.end(), req_h);
@@ -842,6 +858,7 @@ nixlThreadedProgressEngine::postXfer(nixlDocaMemosBackendReqH *req_h,
         req_h->allTasksCompleted_.store(false, std::memory_order_release);
         req_h->cancelled_.store(false, std::memory_order_relaxed);
         req_h->overallStatus_ = NIXL_IN_PROG;
+        req_h->posted_ = true;
 
         NIXL_DEBUG << "Posting transfer with " << req_h->totalTasks_ << " tasks (queued)";
 
@@ -861,6 +878,11 @@ nixlThreadedProgressEngine::releaseRequest(nixlDocaMemosBackendReqH *req_h) cons
     nixl_status_t status;
     {
         const std::lock_guard<std::mutex> g(queueMutex_);
+
+        if (!req_h->posted_) {
+            delete req_h;
+            return NIXL_SUCCESS;
+        }
 
         auto it = std::find_if(producerVec_->begin(),
                                producerVec_->end(),
@@ -1052,6 +1074,7 @@ nixlThreadedProgressEngine::progressThreadFunc() {
             }
             pendingRequests_.pop_front();
             req_h->isPending_ = false;
+            publishIfComplete(req_h);
             made_progress = true;
         }
 
